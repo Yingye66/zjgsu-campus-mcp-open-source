@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "zjgsu-campus": {
+      "command": "C:/path/zjgsu-campus-mcp-open-source/.venv/Scripts/python.exe",
+      "args": [
+        "-m",
+        "src.mcp_server.server"
+      ],
+      "env": {
+        "PYTHONPATH": "C:/path/zjgsu-campus-mcp-open-source",
+        "ZJGSU_CAMPUS_DATA_DIR": "C:/path/private-campus-data"
+      }
+    }
+  }
+}

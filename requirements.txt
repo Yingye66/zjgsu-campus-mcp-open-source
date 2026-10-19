@@ -1,0 +1,5 @@
+# Versions verified in the release preparation environment.
+mcp[cli]==2.2.0
+requests==2.34.2
+pypdf==6.20.1
+python-docx==1.2.0

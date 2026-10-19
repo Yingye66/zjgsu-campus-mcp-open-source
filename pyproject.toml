@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zjgsu-campus-mcp"
+version = "0.1.0"
+description = "我的商大只读校园 MCP：用自然语言查询本人有权访问的校园信息"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+authors = [{name = "Yingye66"}]
+dependencies = ["mcp[cli]==2.2.0", "requests==2.34.2", "pypdf==6.20.1", "python-docx==1.2.0"]
+
+[project.optional-dependencies]
+dev = ["jsonschema==4.26.0"]
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+
+[tool.setuptools.package-data]
+"src.adapters.campus" = ["java/*.java"]

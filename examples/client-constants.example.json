@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "client_id": "REPLACE_WITH_YOUR_LAWFULLY_OBTAINED_LOCAL_VALUE",
+  "des_key_b64": "REPLACE_WITH_YOUR_LAWFULLY_OBTAINED_LOCAL_VALUE",
+  "source": "local_private_configuration"
+}
