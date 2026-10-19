@@ -47,6 +47,33 @@ $env:ZJGSU_CAMPUS_DATA_DIR = "C:/path/private-campus-data"
 密码只输入本人终端，不回显。init 可能保存 App 会话但未成功建立教务会话；按具体成功提示和查询结果判断。
 不要因为来源改版、权限拒绝或代码结构错误反复登录。
 
+### 可选：保存凭据并自动恢复
+
+如果希望会话过期后继续直接提问，在本人终端显式开启。数据目录须与MCP配置一致，密码由终端隐藏输入，不发送给AI：
+
+```powershell
+& .\.venv\Scripts\python.exe -m src.auth.login_cli cred-save
+& .\.venv\Scripts\python.exe -m src.auth.login_cli cred-status
+```
+
+首次初始化也可用 `init --save-cred` 同时登录并保存；普通 `init` 不保存密码。默认时效180天，从保存时间开始；超期表示拒绝继续自动使用，不表示已经证实密码变更。旧版本无版本号的凭据文件需重新执行cred-save。
+
+开启后，工具识别统一会话失效时自动重登、重试一次，在issues中标记auto_relogin；成功、partial和失败分别说明，不把重登本身当作查询成功。缺配置、权限拒绝或网络故障应按提示处理；认证被拒后同版本凭据停止自动重试，确认后用cred-save更新。体测专用令牌、选座Cookie不由统一登录生成。App课表端点99码仅作为受限恢复线索，不是已证实的学校官方认证错误语义。
+
+需要手动刷新或停用保存的密码时：
+
+```powershell
+& .\.venv\Scripts\python.exe -m src.auth.login_cli autologin
+& .\.venv\Scripts\python.exe -m src.auth.login_cli cred-clear
+& .\.venv\Scripts\python.exe -m src.auth.login_cli logout
+```
+
+`cred-clear`删除保存的密码，不删除会话或缓存；`logout`清除活动会话。如果保留凭据又继续查询，可能再次自动登录，所以停止自动恢复时先cred-clear，再按需logout或在客户端禁用本MCP。清除不是安全擦除备份；自行保护私人目录及备份。
+
+密码保存在私人数据目录的credentials.json中，为**明文JSON**。`.gitignore`不是加密或访问控制，Windows ACL未自动收紧。不要把私人目录上传、分享或放进公开同步目录。本次未读取或迁移你的真实凭据，更新代码后只需重载MCP；是否保存密码由使用者自行选择。
+
+常驻MCP和终端命令以数据目录中的`.auth.lock`协调本地认证文件提交。锁只覆盖本地校验/写入，学校登录等待不持锁；不要在进程运行时删除锁文件。它不使所有学校业务查询都具备跨进程事务，其他来源的限制仍适用。
+
 体测使用独立专用会话。现有临时导入命令为 fitness-token，只在确实拥有合法且有效的本人专用令牌时，在终端交互执行；init 不会自动生成该令牌。
 本次验证没有证明所有账号的专用令牌来源和归属。不能把令牌发给 AI，不能拿其他人的令牌。
 

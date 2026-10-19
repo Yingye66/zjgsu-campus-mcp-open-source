@@ -1057,7 +1057,7 @@ class PreserveCredentialsTests(unittest.TestCase):
     """重跑 init 不得清掉独立凭据（选座 Cookie / 体测令牌）。"""
 
     def test_merge_keeps_independent_credentials_only(self):
-        from src.auth.login_cli import _preserve_independent_credentials
+        from src.auth.auto_login import _preserve_independent_credentials
         new = {"zjgsu_token": "new"}
         old = {"zjgsu_token": "old", "jwglxt_cookies": [{"name": "x"}],
                "seat_cookie": "wechatSESS_ID=SECRET",
@@ -1070,7 +1070,7 @@ class PreserveCredentialsTests(unittest.TestCase):
         self.assertEqual(new["zjgsu_token"], "new")
 
     def test_absent_keys_are_not_invented(self):
-        from src.auth.login_cli import _preserve_independent_credentials
+        from src.auth.auto_login import _preserve_independent_credentials
         new = {"zjgsu_token": "new"}
         self.assertEqual(_preserve_independent_credentials(new, None), [])
         self.assertNotIn("seat_cookie", new)

@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from .classify import classify_course
@@ -25,6 +26,24 @@ class TimetableFetch:
     entries: list[dict] | None   # 映射后的 TimetableEntry 列表（ok 时）
     diag: str
     raw_count: int | None        # 来源返回条数（不做成功判据，仅记录）
+    # F29-R6：来源业务码的结构化记录（仅本端点；供服务层受限标记恢复信号，
+    # 不改变 classify 的 outcome 语义）
+    raw_business_code: str | None = None
+
+
+def _course_business_code(text: object) -> str | None:
+    """从原始响应提取 data.code（结构化；失败返回 None，不参与成功判定）。"""
+    try:
+        d = json.loads(text or "")
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    data = d.get("data")
+    if not isinstance(data, dict):
+        return None
+    code = data.get("code")
+    return None if code is None else str(code)
 
 
 def fetch_timetable(transport, token: str, start_date: str, end_date: str) -> TimetableFetch:
@@ -35,7 +54,8 @@ def fetch_timetable(transport, token: str, start_date: str, end_date: str) -> Ti
     if outcome == "ok_empty":
         return TimetableFetch(outcome="ok_empty", entries=[], diag=diag, raw_count=0)
     if outcome != "ok":
-        return TimetableFetch(outcome=outcome, entries=None, diag=diag, raw_count=None)
+        return TimetableFetch(outcome=outcome, entries=None, diag=diag, raw_count=None,
+                              raw_business_code=_course_business_code(r.get("text")))
 
     entries, violations = validate_and_map(items or [])
     if entries is None:

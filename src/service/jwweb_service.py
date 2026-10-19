@@ -3996,7 +3996,8 @@ class JWWebService(CampusService):
                                      E.issue(E.AUTH_REQUIRED, False,
                                              "体测 token 未建立：请在 App 打开体测页后"
                                              "用 login_cli 的 fitness-token 命令导入令牌"
-                                             "（原 init 不包含体测会话）"),
+                                             "（原 init 不包含体测会话）",
+                                             auth_domain="independent"),
                                      safe_url, "tzjk-parser/0.1.0",
                                      "validation/mypage/取证记录.md")
         acct = acct0
@@ -4163,7 +4164,8 @@ class JWWebService(CampusService):
                                      E.issue(E.AUTH_REQUIRED, False,
                                              "体测 token 未建立：请在 App 打开体测页后"
                                              "用 login_cli 的 fitness-token 命令导入令牌"
-                                             "（原 init 不包含体测会话）"),
+                                             "（原 init 不包含体测会话）",
+                                             auth_domain="independent"),
                                      safe_url, "tzjk-parser/0.1.0",
                                      "validation/mypage/取证记录.md")
         acct = acct0

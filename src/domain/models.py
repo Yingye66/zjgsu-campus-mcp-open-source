@@ -78,6 +78,12 @@ class Issue(TypedDict):
     code: str
     retryable: bool
     safe_message: str
+    # F29：认证域标记——"independent" 表示独立凭据（体测 token 等），
+    # 统一认证自动重登无法修复；缺省（无该键）= unified 域。
+    auth_domain: NotRequired[str]
+    # F29-R6：结构化恢复信号——"app_session" 仅由服务层按来源/端点/业务码/
+    # 本机会话条件设置；恢复判定只认该字段，不解析提示文本。
+    auth_hint: NotRequired[str]
 
 
 class SourceRef(TypedDict):

@@ -37,6 +37,17 @@ OUTCOME_TO_CODE = {
 }
 
 
-def issue(code: str, retryable: bool, safe_message: str) -> dict:
-    """构造统一 issue 结构（与第 8 节包装契约一致）。"""
-    return {"code": code, "retryable": bool(retryable), "safe_message": str(safe_message)}
+def issue(code: str, retryable: bool, safe_message: str,
+          auth_domain: str | None = None, auth_hint: str | None = None) -> dict:
+    """构造统一 issue 结构（与第 8 节包装契约一致）。
+
+    auth_domain（F29）：仅认证类 issue 可选标注；"independent" 表示独立凭据域
+    （体测 token 等），统一认证自动重登无法修复，不得触发重登。
+    auth_hint（F29-R6）：结构化恢复信号——"app_session" 仅由服务层在
+    来源/端点/业务码/本机会话均满足条件时设置，恢复判定只认该字段，不认提示文本。"""
+    out = {"code": code, "retryable": bool(retryable), "safe_message": str(safe_message)}
+    if auth_domain:
+        out["auth_domain"] = str(auth_domain)
+    if auth_hint:
+        out["auth_hint"] = str(auth_hint)
+    return out

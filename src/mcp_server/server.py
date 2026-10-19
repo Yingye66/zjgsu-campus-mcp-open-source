@@ -37,6 +37,7 @@
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import time
@@ -47,6 +48,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from ..adapters.career.events import EVENT_TYPE_XJH
+from ..auth.session import bind_account, get_active_file, reset_account
+from ..domain import errors as E
 from ..domain.models import (ApprovalsObservation, DigitalResourcesObservation,
                              HandbookObservation, LaborCourseDetailObservation, LaborCoursesObservation,
                              PublicationsObservation, FitnessScheduleObservation, EvaluationResultObservation, FitnessScoresObservation, JwwNoticesObservation, LibrarySearchObservation, PreselectInfoObservation, CourseCatalogObservation, AppMessagesObservation, ExamRegistrationsObservation, CampusNewsObservation, LibraryInfoObservation, CareerInfoObservation, JobFairsObservation, ClassTimetableObservation, NoticesObservation, CampusServicesObservation, AcademicProgressObservation, AcademicWarningsObservation,
@@ -65,6 +68,7 @@ from ..domain.models import (ApprovalsObservation, DigitalResourcesObservation,
                              TrainingPlanDocObservation,
                              LibrarySeatsObservation, DormElectricObservation)
 from ..paths import default_data_dir
+from ..service.auto_relogin import attempt_auto_relogin, credential_issue_hint
 from ..service.campus_service import CampusService
 from ..service.electric_service import ElectricService
 from ..service.jwweb_service import JWWebService
@@ -102,7 +106,8 @@ mcp = MCPServer(
         "本服务只读、本机运行，面向「我的商大」校园信息；不提供选课/提交/缴费等任何写操作。\n"
         "两类数据源：\n"
         "① 课表（campus.timetable）——需要本机会话（先运行 python -m src.auth.login_cli init），"
-        "工具不接收账号、密码或 token 参数；\n"
+        "工具不接收账号、密码或 token 参数；"
+        "本机凭据层已保存凭据（login_cli cred-save）时，会话失效将自动重登并重试一次；\n"
         "①b 教务网页版三件套（campus.exams / campus.grades / campus.timetable_web）——"
         "同样依赖本机会话（login_cli init 时顺带建立教务 CAS 会话）；"
         "xnm=4位学年（2025 表示 2025-2026 学年），xqm=学期码（3=第一学期，12=第二学期，16=短学期）；\n"
@@ -149,6 +154,127 @@ def _to_call_result(wrapper: dict) -> CallToolResult:
     )
 
 
+# —— F29：会话失效自动恢复（凭据层 + 自动重登一次 + 重放） ——
+ISSUE_AUTO_RELOGIN = "auto_relogin"                     # 信息性：结果经自动重登后取得
+ISSUE_CREDENTIAL_UPDATE = "credential_update_required"  # 自动重登失败：提醒更新凭据
+
+
+def _payload_of(result):
+    """从工具返回取包装字典：兼容 dict 与生产真实 CallToolResult。
+
+    返回 (payload, wrapped)；wrapped=True 表示原始返回为 CallToolResult，
+    修改后必须经 _to_call_result 重建，保证 text / structuredContent / isError 同源一致。"""
+    if isinstance(result, dict):
+        return result, False
+    structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured, True
+    return None, False
+
+
+def _has_auth_issue(result) -> bool:
+    """结果是否为「统一认证会话失效」类问题（独立凭据域一律不计入）。
+
+    判定只使用**结构化字段**，不依赖任何提示文本前缀：
+    1. `auth_required`（unified）——教务网页版/流程/App 会话缺失的标准码；
+    2. `business_error` + `auth_hint="app_session"`——仅由服务层在
+       「来源 = src.course-api（App 课表端点）且业务码 99 且本机会话存在」时设置，
+       属于有来源/端点依据的受限信号；其他来源/其他业务码不得触发。
+    独立域（`auth_domain="independent"`，如体测令牌缺失）在任何分支之前统一排除。"""
+    payload, _ = _payload_of(result)
+    if payload is None or payload.get("status") not in ("unavailable", "partial"):
+        return False
+    for item in payload.get("issues") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("auth_domain") == "independent":
+            continue  # 独立凭据域：统一认证重登无法修复
+        code = item.get("code")
+        if code == E.AUTH_REQUIRED:
+            return True
+        if code == E.BUSINESS_ERROR and item.get("auth_hint") == "app_session":
+            return True
+    return False
+
+
+def _append_issue(payload: dict, code: str, message: str) -> None:
+    payload.setdefault("issues", []).append(E.issue(code, False, message))
+
+
+def _auto_relogin(fn):
+    """工具包装：会话失效时用本机凭据层自动重登（一次）并重放调用。
+
+    - **请求级账号固定（F29-R1）**：进入包装时（首次查询之前）读取并绑定账号域，
+      本次请求内所有服务读取（含重放）都使用该账号；查询期间用户切号只影响后续
+      请求，旧请求不读/不返回新账号数据；恢复发布前再校验账号与会话代次，变化即放弃；
+    - 兼容生产真实返回类型 CallToolResult（structured_content 判定；重建走
+      _to_call_result，文本/结构化/isError 同源一致）；
+    - 凭据层未启用（未保存凭据）→ 原样返回，既有行为零改动；
+    - 重登成功 → 重放一次；**按最终 status 描述**：仅 ok 声明成功，
+      partial 说明不完整，unavailable 保留失败与下一步（F29-R5）；
+    - 重登失败 → 原结果追加 credential_update_required 提醒（缺失/超期/熔断各有指引）；
+    - 全程不打印凭据；并发失效由 auto_relogin 的锁与版本去重（同批只登录一次）。"""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        # 首次查询之前固定账号（真实磁盘值），并绑定到请求上下文
+        try:
+            expected = get_active_file(DATA_DIR)
+        except Exception:
+            expected = None
+        token = bind_account(expected)
+        try:
+            first = fn(*args, **kwargs)
+            if not _has_auth_issue(first):
+                return first
+            payload, wrapped = _payload_of(first)
+            if payload is None:
+                return first
+
+            try:
+                # 位置参数：兼容隔离测试/审查脚本对 attempt 的替换签名
+                attempt = attempt_auto_relogin(DATA_DIR, expected)
+            except Exception:
+                attempt = {"outcome": "failed", "auth_failed": False,
+                           "diag": "自动恢复调用异常（已降级，不影响工具返回）"}
+            outcome = attempt.get("outcome")
+
+            if outcome == "skipped":
+                reason = attempt.get("reason")
+                if reason == "credentials_missing":
+                    return first  # 未启用凭据层：保持既有行为（零改动）
+                hint = credential_issue_hint(DATA_DIR, reason=reason) or {}
+                _append_issue(payload, ISSUE_CREDENTIAL_UPDATE,
+                              hint.get("hint")
+                              or "自动恢复已拒绝（%s）；请更新凭据。" % reason)
+                return _to_call_result(payload) if wrapped else payload
+
+            if outcome == "ok":
+                second = fn(*args, **kwargs)
+                payload2, _ = _payload_of(second)
+                if payload2 is None:
+                    return second
+                status2 = payload2.get("status")
+                if status2 == "ok":
+                    note = "会话已失效，已用本机凭据自动重登并重试成功（无需人工处理）。"
+                elif status2 == "partial":
+                    note = ("会话已失效，已用本机凭据自动重登；重试仍有缺口（partial），"
+                            "数据可能为旧快照/不完整，请按 freshness 与 coverage 说明使用。")
+                else:
+                    note = ("会话已失效，已用本机凭据自动重登，但重试仍失败（%s）；"
+                            "请查看 issues 与来源说明，必要时稍后重试或人工处理。" % status2)
+                _append_issue(payload2, ISSUE_AUTO_RELOGIN, note)
+                return _to_call_result(payload2) if wrapped else payload2
+
+            hint = credential_issue_hint(DATA_DIR) or {}
+            _append_issue(payload, ISSUE_CREDENTIAL_UPDATE,
+                          hint.get("hint")
+                          or "自动重登未成功；请更新本机凭据或重新运行 login_cli init。")
+            return _to_call_result(payload) if wrapped else payload
+        finally:
+            reset_account(token)
+    return wrapper
+
+
 @mcp.tool(
     description=(
         "列出「我的商大」能力台账：各模块的菜单线索、数据范围、证据等级、适配器状态、"
@@ -157,6 +283,7 @@ def _to_call_result(wrapper: dict) -> CallToolResult:
     ),
     annotations=READ_ONLY_LOCAL,
 )
+@_auto_relogin
 def list_campus_capabilities() -> Annotated[CallToolResult, CapabilitiesReport]:
     return _to_call_result(service.list_capabilities())
 
@@ -168,11 +295,13 @@ def list_campus_capabilities() -> Annotated[CallToolResult, CapabilitiesReport]:
         "pagination.next_cursor 原样传入（游标与账号域和查询范围绑定，不匹配会被拒绝）。"
         "服务端未提供总数或分页结束证据：coverage.complete 恒为 false，返回条数不是全量结论。"
         "刷新失败时可能返回 status=partial 与旧缓存（freshness 说明数据年龄）；"
-        "未完成登录初始化时返回 status=unavailable（auth_required）。"
+        "未完成登录初始化时返回 status=unavailable（auth_required）——"
+        "凭据层已启用时会自动重登一次后重试（issues 注明 auto_relogin）；"
         "成功非空结果可复用60秒，freshness.cache_hit标明命中；要最新请传force_refresh=true（仅首页）。"
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_timetable(
     start_date: str,
     end_date: str,
@@ -192,11 +321,13 @@ def get_timetable(
         "字段为来源原文（考试名称/日期时段文本/教室/方式），不拆分不推算；"
         "来源未提供座位号。按来源 totalCount/totalPage 分页遍历并对账：全量取得→status=ok；"
         "对账不符/分页失败→partial 并给出缺口（coverage.complete 恒 false，需与教务页面对照）。"
-        "会话过期时返回 unavailable(auth_required)，需重跑 python -m src.auth.login_cli init。"
+        "会话过期时返回 unavailable(auth_required)；凭据层已启用（cred-save）时自动重登一次并重试，"
+        "失败则追加 credential_update_required 提醒更新凭据。"
         "成功非空结果可复用60秒，freshness.cache_hit标明命中；要最新请传force_refresh=true（仅首页）。"
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_exams(
     xnm: str,
     xqm: str,
@@ -222,6 +353,7 @@ def get_exams(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_grades(
     xnm: str,
     xqm: str,
@@ -247,6 +379,7 @@ def get_grades(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_timetable_web(
     xnm: str,
     xqm: str,
@@ -278,6 +411,7 @@ def get_timetable_web(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_grade_details(
     xnm: str,
     xqm: str,
@@ -299,6 +433,7 @@ def get_grade_details(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_internship_grades(
     xnm: str,
     xqm: str,
@@ -319,6 +454,7 @@ def get_internship_grades(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_academic_progress(
     cursor: str | None = None,
     limit: int = 50,
@@ -336,6 +472,7 @@ def get_academic_progress(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_training_plans(
     year: str,
     keyword: str | None = None,
@@ -357,6 +494,7 @@ def get_training_plans(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_training_plan_doc(
     plan_name: str,
     grade: str,
@@ -373,6 +511,7 @@ def get_training_plan_doc(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_teaching_plans(
     year: str,
     keyword: str | None = None,
@@ -392,6 +531,7 @@ def get_teaching_plans(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_teaching_plan_courses(
     plan_ref: str,
     keyword: str | None = None,
@@ -412,6 +552,7 @@ def get_teaching_plan_courses(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_retake_courses(
     cxxnm: str,
     cxxqm: str,
@@ -432,6 +573,7 @@ def get_retake_courses(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_academic_warnings(
     cursor: str | None = None,
     limit: int = 50,
@@ -448,6 +590,7 @@ def get_academic_warnings(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_credit_requirements(
     cursor: str | None = None,
     limit: int = 50,
@@ -465,6 +608,7 @@ def get_credit_requirements(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_my_profile(
     cursor: str | None = None,
     limit: int = 50,
@@ -484,6 +628,7 @@ def get_my_profile(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_syllabus(
     xnm: str,
     xqm: str,
@@ -501,6 +646,7 @@ def get_syllabus(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_online_class_urls(
     xnm: str,
     xqm: str,
@@ -518,6 +664,7 @@ def get_online_class_urls(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_innovation_scores(
     cursor: str | None = None,
     limit: int = 50,
@@ -535,6 +682,7 @@ def get_innovation_scores(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_teacher_page(
     keyword: str,
     detail: bool = False,
@@ -554,6 +702,7 @@ def get_teacher_page(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def list_campus_services(
     keyword: str | None = None,
     cursor: str | None = None,
@@ -571,6 +720,7 @@ def list_campus_services(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_campus_notices(
     detail_url: str | None = None,
     keyword: str | None = None,
@@ -592,6 +742,7 @@ def get_campus_notices(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_job_fairs(
     detail_id: str | None = None,
     cursor: str | None = None,
@@ -611,6 +762,7 @@ def get_job_fairs(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_career_info(
     category: str,
     keyword: str | None = None,
@@ -631,6 +783,7 @@ def get_career_info(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_campus_news(
     category: str = "3",
     detail_url: str | None = None,
@@ -650,6 +803,7 @@ def get_campus_news(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_library_info(
     category: str = "gzbj",
     cursor: str | None = None,
@@ -671,6 +825,7 @@ def get_library_info(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_library_seats() -> Annotated[CallToolResult, LibrarySeatsObservation]:
     return _to_call_result(seat_service.get_seat_summary())
 
@@ -689,6 +844,7 @@ def get_library_seats() -> Annotated[CallToolResult, LibrarySeatsObservation]:
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_dorm_electric(
     mode: str = "summary",
     month: str | None = None,
@@ -704,6 +860,7 @@ def get_dorm_electric(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_exam_registrations(
     cursor: str | None = None,
     limit: int = 30,
@@ -719,6 +876,7 @@ def get_exam_registrations(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_my_messages(
     cursor: str | None = None,
     limit: int = 20,
@@ -737,6 +895,7 @@ def get_my_messages(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_course_catalog(
     keyword: str | None = None,
     xnm: str | None = None,
@@ -757,6 +916,7 @@ def get_course_catalog(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_preselect_info(
     xnm: str | None = None,
     xqm: str | None = None,
@@ -776,6 +936,7 @@ def get_preselect_info(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_library_search(
     keyword: str = "",
     search_type: str = "book",
@@ -796,6 +957,7 @@ def get_library_search(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_jww_notices(
     detail_url: str | None = None,
     keyword: str | None = None,
@@ -816,6 +978,7 @@ def get_jww_notices(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_fitness_scores(
     cursor: str | None = None,
     limit: int = 20,
@@ -832,6 +995,7 @@ def get_fitness_scores(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_evaluation_result(
     cursor: str | None = None,
     limit: int = 20,
@@ -847,6 +1011,7 @@ def get_evaluation_result(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_fitness_schedule(
     cursor: str | None = None,
     limit: int = 20,
@@ -863,6 +1028,7 @@ def get_fitness_schedule(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_labor_courses(
     cursor: str | None = None,
     limit: int = 20,
@@ -879,6 +1045,7 @@ def get_labor_courses(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_labor_course_detail(
     project_id: str,
     cursor: str | None = None,
@@ -896,6 +1063,7 @@ def get_labor_course_detail(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_student_handbook(
     keyword: str | None = None,
     cursor: str | None = None,
@@ -914,6 +1082,7 @@ def get_student_handbook(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_free_classrooms(
     dm: str,
     xqh_id: str = "2",
@@ -939,6 +1108,7 @@ def get_free_classrooms(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_class_timetable(
     class_name: str | None = None,
     bh_id: str | None = None,
@@ -965,6 +1135,7 @@ def get_class_timetable(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_campus_events(
     start_date: str,
     end_date: str,
@@ -989,6 +1160,7 @@ def get_campus_events(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_my_approvals(
     scope: str = "mine",
     cursor: str | None = None,
@@ -1006,6 +1178,7 @@ def get_my_approvals(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_scholarship_publications(
     keyword: str | None = None,
     page: int = 1,
@@ -1028,6 +1201,7 @@ def get_scholarship_publications(
     ),
     annotations=READ_ONLY_NETWORK,
 )
+@_auto_relogin
 def get_digital_resources(
     category: str = "all",
     keyword: str | None = None,
@@ -1046,6 +1220,7 @@ def get_digital_resources(
     ),
     annotations=READ_ONLY_LOCAL,
 )
+@_auto_relogin
 def get_source_health(module_id: str | None = None) -> Annotated[CallToolResult, HealthReport]:
     return _to_call_result(service.get_source_health(module_id=module_id))
 

@@ -305,7 +305,16 @@ class CampusService:
 
         code = E.OUTCOME_TO_CODE.get(fetch.outcome, E.PARSER_MISMATCH)
         retryable = fetch.outcome in ("network_error", "http_error")
-        isu = E.issue(code, retryable, fetch.diag)
+        # F29-R6：App 课表端点的业务码 99 结构化标记——仅当
+        # 来源=src.course-api、原始业务码=99、且本机持有 App 会话（token 非空）时设置。
+        # classify 的 outcome 语义不变（99 仍不映射 auth_required）；其他来源/其他码不标记。
+        auth_hint = None
+        if (fetch.outcome == "business_error"
+                and getattr(fetch, "raw_business_code", None) == "99"
+                and source == SOURCE_COURSE_API
+                and session.get("zjgsu_token")):
+            auth_hint = "app_session"
+        isu = E.issue(code, retryable, fetch.diag, auth_hint=auth_hint)
         self.store.record_issue(acct, module, source, now_s, scope, isu)
         old = self.store.get_snapshot(acct, module, source, scope)
         if old:

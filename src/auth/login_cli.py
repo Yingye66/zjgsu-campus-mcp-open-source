@@ -3,48 +3,43 @@
 
 用法（在项目根目录、交互式终端中运行）：
     .venv\\Scripts\\python.exe -m src.auth.login_cli init     # 登录并保存本机会话（默认）
+    .venv\\Scripts\\python.exe -m src.auth.login_cli init --save-cred [天数]  # 登录成功后顺带保存凭据
+    .venv\\Scripts\\python.exe -m src.auth.login_cli cred-save      # 保存统一认证凭据（供自动重登）
+    .venv\\Scripts\\python.exe -m src.auth.login_cli cred-status    # 查看凭据状态（掩码，不含秘密）
+    .venv\\Scripts\\python.exe -m src.auth.login_cli cred-clear     # 清除已保存凭据
+    .venv\\Scripts\\python.exe -m src.auth.login_cli autologin     # 用已存凭据非交互刷新会话
     .venv\\Scripts\\python.exe -m src.auth.login_cli status   # 查看会话状态（不含秘密）
     .venv\\Scripts\\python.exe -m src.auth.login_cli logout   # 清除本机会话（缓存随之不可读）
 
-边界（对应探针 P01/P05 与交接文档第 7 节）：
-- 凭据仅在本人交互式终端输入（非 TTY 拒绝）；密码不回显、不落盘、不写日志；
+边界（对应探针 P01/P05 与交接文档第 7 节，及 F29 凭据存储设计）：
+- init 路径：凭据仅在本人交互式终端输入（非 TTY 拒绝）；密码不回显、不写日志；
+- cred-save 路径：同样交互式输入（非 TTY 拒绝）；凭据写入 data/credentials.json
+  （本机私有目录 + .gitignore；明文 JSON，与会话文件同级别边界；原子写）；
+- autologin 路径：非交互、无参数——凭据来自本机凭据层文件，不经过 stdin/管道，
+  全程不回显不打印；凭据缺失/超期/上次失败时拒绝执行并明确提醒更新；
 - 本 CLI 与 MCP 服务分离：MCP 工具永远不会询问或接收凭据；
+  MCP 服务端仅在「会话失效 + 凭据层可用」时自动重登（见 src/service/auto_relogin.py）；
 - 会话文件（含 zjgsuToken）写入 data/sessions/（私有目录，.gitignore 排除）；
-- 输出不包含 token、用户名原文（仅显示不可逆的账号域标识）。
+- 输出不含 token、密码；用户名仅以掩码显示。
 """
 from __future__ import annotations
 
 import getpass
-import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from ..adapters.campus import auth as campus_auth
-from ..adapters.campus.constants import CampusConfigError, load_client_constants
-from ..adapters.campus.des import find_java
-from ..adapters.campus.transport import UrllibTransport
+from ..auth.session import (account_scope_id, clear_active, delete_session, get_active,
+                            load_session)
 from ..paths import default_data_dir
-from .session import (account_scope_id, clear_active, delete_session, get_active,
-                      load_session, save_session, set_active)
+from .auto_login import check_environment, login_and_save_session
+from .credential_store import (DEFAULT_TTL_DAYS, CredentialWriteError, clear_credentials,
+                               evaluate, load_credentials, mark_login_failed,
+                               mark_login_ok, save_credentials, status_for_display)
+from .file_lock import authentication_lock
 
 TZ = timezone(timedelta(hours=8))
-
-# 独立凭据（不随统一认证会话轮换）：重跑 init 时保留，避免静默丢失
-_PRESERVED_SESSION_KEYS = ("seat_cookie", "seat_cookie_saved_at",
-                           "tzjk_token", "tzjk_student_no")
-
-
-def _preserve_independent_credentials(session: dict, old: dict | None) -> list:
-    """把旧会话中的独立凭据并入新会话，返回保留的键名（不打印值）。"""
-    kept = []
-    if not isinstance(old, dict):
-        return kept
-    for key in _PRESERVED_SESSION_KEYS:
-        if old.get(key) and not session.get(key):
-            session[key] = old[key]
-            kept.append(key)
-    return kept
 
 
 def _now_s() -> str:
@@ -65,7 +60,7 @@ def cmd_status() -> int:
         return 1
     _print("账号域标识：%s（不可逆；不含用户名原文）" % acct)
     if not session:
-        _print("会话：缺失（请先运行 init）")
+        _print("会话：缺失（请先运行 init 或 autologin）")
         return 1
     _print("会话：存在")
     _print("  用户类型：%s（2=学生）" % session.get("user_type"))
@@ -75,10 +70,12 @@ def cmd_status() -> int:
 
 def cmd_logout() -> int:
     data_dir = default_data_dir()
-    acct = get_active(data_dir)
+    with authentication_lock(data_dir):
+        acct = get_active(data_dir)
+        if acct:
+            delete_session(data_dir, acct)
+            clear_active(data_dir)
     if acct:
-        delete_session(data_dir, acct)
-        clear_active(data_dir)
         _print("本机会话已清除（账号域 %s）。" % acct)
     else:
         _print("本来就没有生效会话。")
@@ -86,22 +83,48 @@ def cmd_logout() -> int:
     return 0
 
 
-def cmd_init() -> int:
+def _print_login_result(result: dict, acct_hint: str | None = None) -> int:
+    """打印 login_and_save_session 的结果（init 与 autologin 共用；不含秘密）。"""
+    if result["outcome"] == "environment":
+        _print("已停止（环境不可用）：%s" % result["diag"])
+        _print("（凭据未验证；自动登录熔断状态不变。）")
+        return 2
+    if result["outcome"] != "ok":
+        _print("登录未完成：%s" % result["diag"])
+        return 1
+    _print("教务网页版会话 ✓（jwglxt_cookies 已入会话）"
+           if result.get("jwweb_ok")
+           else "教务网页版会话未建立（%s）；教务网页版工具将不可用，可稍后重跑刷新。"
+                % (result.get("jwweb_diag") or "原因未知"))
+    if result.get("kept_independent"):
+        _print("已保留本机独立凭据：%s（未重新获取）"
+               % "、".join(result["kept_independent"]))
+    _print("登录成功：%s" % result.get("diag", ""))
+    if result.get("identity_changed"):
+        _print("注意：身份类型发生变化（%s → %s）；涉身份口径的工具输出以新会话为准。"
+               % (result.get("old_user_type"), result.get("user_type")))
+    if str(result.get("user_type")) != "2":
+        _print("注意：当前身份不是学生（user_type=%s），课表模块将显示为不可用。"
+               % result.get("user_type"))
+    if acct_hint:
+        _print("会话已保存（私有目录）；账号域标识：%s" % acct_hint)
+    return 0
+
+
+def cmd_init(save_cred_ttl: int | None = None) -> int:
     data_dir = default_data_dir()
 
     _print("== 「我的商大」登录初始化（本机） ==")
-    _print("凭据仅用于本机向学校接口发起登录；密码不回显、不落盘。")
+    _print("凭据仅用于本机向学校接口发起登录；密码不回显、不写日志。")
+    if save_cred_ttl:
+        _print("已启用 --save-cred：登录成功后凭据将写入本机凭据层（data/credentials.json，"
+               "时效 %s 天，供会话失效时自动重登）。" % save_cred_ttl)
     _print()
 
     # —— 工具前置检查（在询问凭据之前） ——
-    try:
-        constants = load_client_constants(data_dir)
-    except CampusConfigError as e:
-        _print("已停止（配置缺失）：%s" % e)
-        return 2
-    java_bin = find_java()
-    if not java_bin:
-        _print("已停止：未找到可用 java（DES 加密桥需要完整 JDK）。")
+    constants, env_err = check_environment(data_dir)
+    if constants is None:
+        _print("已停止：%s" % env_err)
         return 2
     _print("工具检查通过：客户端常量 ✓（值不显示）、Java ✓")
 
@@ -123,67 +146,163 @@ def cmd_init() -> int:
         return 1
 
     acct = account_scope_id(username, constants["client_id"])
-    transport = UrllibTransport()
-    result = campus_auth.perform_login(constants, transport, username, password, java_bin)
+    result = login_and_save_session(data_dir, username, password)
 
     _print()
     if result["outcome"] != "ok":
-        # R25：密码引用统一在所有认证路径结束后清除；此处直接退出由局部变量回收
-        _print("登录未完成：%s：%s" % (result["outcome"], result["diag"]))
-        _print("（未保存任何会话；如需重试请重新运行 init。）")
-        return 1
-
-    session = {
-        "schema": 1,
-        "account_scope_id": acct,
-        "client_id": constants["client_id"],
-        "zjgsu_token": result["token"],
-        "user_type": result["user_type"],
-        "created_at": _now_s(),
-    }
-
-    # —— 教务网页版（jwglxt）CAS 会话：同一凭据顺带建立（R25：失败/异常都不阻断已成功的 App 会话） ——
-    from ..adapters.campus.jwweb import cas_login as jwweb_cas_login
-    jw_ok = False
-    try:
-        jw = jwweb_cas_login(username, password)
-        if jw["outcome"] == "ok":
-            session["jwglxt_cookies"] = jw["cookies"]
-            jw_ok = True
-            # §2.78：App 域（my.zjgsu）cookie 顺带保存——服务目录长期入口
-            if jw.get("app_cookies"):
-                session["app_cookies"] = jw["app_cookies"]
-            _print("教务网页版会话 ✓（jwglxt_cookies 已入会话）")
-        else:
-            _print("教务网页版会话未建立（%s：%s）；"
-                   "get_exams/get_grades/get_timetable_web 将不可用，"
-                   "可稍后重跑本命令刷新。" % (jw["outcome"], jw["diag"]))
-    except Exception as e:
-        _print("教务网页版会话异常（%s：%s）；App 会话不受影响，"
-               "可稍后重跑本命令刷新。" % (type(e).__name__, e))
-    finally:
-        # R25：两次认证全部结束后才丢弃明文密码引用
+        code = _print_login_result(result)
+        # R25：所有认证路径结束后丢弃明文密码引用
         del password
+        _print("（未保存任何会话；如需重试请重新运行 init。）")
+        return code
 
-    # 独立凭据（选座 Cookie / 体测令牌）不属于统一认证会话，重跑 init 不得清掉
-    old_session = load_session(data_dir, acct)
-    kept = _preserve_independent_credentials(session, old_session)
-    save_session(data_dir, acct, session)
-    set_active(data_dir, acct)
+    # —— F29：可选保存凭据（登录成功后；保存完成立即丢弃明文引用） ——
+    saved_cred = False
+    if save_cred_ttl:
+        try:
+            save_credentials(data_dir, username, password, ttl_days=save_cred_ttl)
+            saved_cred = True
+        except ValueError as e:
+            _print("凭据保存失败（参数无效）：%s" % e)
+        except CredentialWriteError as e:
+            # R3：登录会话本身成功，但凭据未保存——两者必须分开说明
+            _print("登录会话成功，但凭据未能保存：%s" % e)
+            _print("（本次会话可用；下次会话失效仍需手动 init 或重新 cred-save。）")
+    # R25：两次认证与凭据保存全部结束后才丢弃明文密码引用
+    del password
 
-    _print("登录成功：%s" % result["diag"])
-    if kept:
-        _print("已保留本机独立凭据：%s（未重新获取）" % "、".join(kept))
-    # 身份元数据变化提示（旧会话存在且 user_type 不同）
-    old_type = (old_session or {}).get("user_type")
-    if old_type is not None and str(old_type) != str(result["user_type"]):
-        _print("注意：身份类型发生变化（%s → %s）；涉身份口径的工具输出以新会话为准。"
-               % (old_type, result["user_type"]))
-    _print("会话已保存（私有目录）；账号域标识：%s" % acct)
-    if str(result["user_type"]) != "2":
-        _print("注意：当前身份不是学生（user_type=%s），课表模块将显示为不可用。" % result["user_type"])
-    _print("下一步：启动 MCP 服务（run_server.ps1）并在客户端中调用 get_timetable。")
+    code = _print_login_result(result, acct_hint=acct)
+    if saved_cred:
+        st = status_for_display(data_dir)
+        _print("凭据已写入本机凭据层（用户名 %s，时效 %s 天）："
+               "此后会话失效时 MCP 工具将自动重登，无需人工干预。"
+               % (st.get("username_masked"), st.get("ttl_days")))
+    return code
+
+
+def cmd_cred_save() -> int:
+    """F29：交互式保存统一认证凭据（供会话失效时自动重登）。"""
+    data_dir = default_data_dir()
+    _print("== 保存统一认证凭据（本机凭据层） ==")
+    _print("用途：MCP 会话失效时自动重登；文件 data/credentials.json（本机私有 + .gitignore，"
+           "明文 JSON，与会话文件同级别边界）。")
+    _print("时效：超过保存时效（默认 %d 天）后自动登录将拒绝使用并提醒更新，防止旧密码撞锁。" % DEFAULT_TTL_DAYS)
+    _print()
+    if not sys.stdin.isatty():
+        _print("cred-save 需要交互式输入（当前非终端环境）——请在真实终端运行")
+        return 2
+    try:
+        username = input("用户名（学号/工号）：").strip()
+        password = getpass.getpass("密码（不回显）：")
+        ttl_raw = input("时效（天，回车=默认 %d）：" % DEFAULT_TTL_DAYS).strip()
+    except (KeyboardInterrupt, EOFError):
+        _print("已取消输入。")
+        return 1
+    if not username or not password:
+        _print("用户名或密码为空，已退出。")
+        return 1
+    ttl_days = int(ttl_raw) if ttl_raw.isdigit() and int(ttl_raw) > 0 else DEFAULT_TTL_DAYS
+    try:
+        save_credentials(data_dir, username, password, ttl_days=ttl_days)
+    except ValueError as e:
+        _print("保存失败：%s" % e)
+        return 1
+    except CredentialWriteError as e:
+        # R3：写入失败必须非零退出且明确“未保存”（不得打印“凭据已保存”）
+        _print("凭据未保存：%s" % e)
+        _print("（磁盘上仍是原来的凭据；如为首次保存，当前没有可用凭据。）")
+        return 1
+    st = status_for_display(data_dir)
+    _print()
+    _print("凭据已保存：用户名 %s、时效 %s 天、保存时间 %s。"
+           % (st.get("username_masked"), st.get("ttl_days"), st.get("saved_at")))
+    _print("密码不回显、不写日志；如需清除运行 cred-clear。")
+    _print("此后 MCP 工具遇到会话失效将自动用该凭据重登（一次），无需人工干预。")
     return 0
+
+
+def cmd_cred_status() -> int:
+    data_dir = default_data_dir()
+    st = status_for_display(data_dir)
+    _print("== 本机凭据状态 ==")
+    if not st.get("present"):
+        _print("凭据：未保存（%s）" % st.get("reason"))
+        _print("如需自动重登能力：运行 cred-save 或 init --save-cred。")
+        return 1
+    _print("凭据：存在（用户名 %s）" % st.get("username_masked"))
+    _print("  保存时间：%s；时效：%s 天（已存 %s 天）"
+           % (st.get("saved_at"), st.get("ttl_days"), st.get("age_days")))
+    _print("  可自动使用：%s（%s）" % ("是" if st.get("usable") else "否", st.get("reason")))
+    if st.get("last_login_ok_at"):
+        _print("  最近自动登录成功：%s" % st.get("last_login_ok_at"))
+    if st.get("last_fail_at"):
+        _print("  最近失败：%s（%s）" % (st.get("last_fail_at"),
+                                        st.get("last_fail_diag") or "无诊断"))
+    return 0 if st.get("usable") else 1
+
+
+def cmd_cred_clear() -> int:
+    data_dir = default_data_dir()
+    if clear_credentials(data_dir):
+        _print("凭据已清除（data/credentials.json）。")
+    else:
+        _print("本来就没有已保存的凭据。")
+    return 0
+
+
+def cmd_autologin() -> int:
+    """F29：非交互自动登录——凭据来自本机凭据层（不经过 stdin/管道）。
+
+    凭据缺失/损坏/超期/上次失败（熔断）→ 拒绝执行并提醒更新（防旧密码撞锁号）；
+    登录被拒 → 标记熔断；网络/环境问题 → 不熔断。"""
+    data_dir = default_data_dir()
+    _print("== 「我的商大」自动登录（本机凭据层） ==")
+    cred = load_credentials(data_dir)
+    ev = evaluate(cred)
+    if not ev.get("usable"):
+        reason = ev.get("reason")
+        if reason in ("credentials_missing", "credentials_invalid"):
+            _print("已停止：本机凭据层%s。"
+                   % ("未保存凭据" if reason == "credentials_missing" else "凭据文件损坏"))
+            _print("请运行 cred-save（或 init --save-cred）保存凭据。")
+        elif reason == "credentials_expired":
+            _print("已停止：凭据已超期（已存 %s 天 > 时效 %s 天），可能已改密。"
+                   % (ev.get("age_days"), (cred or {}).get("ttl_days")))
+            _print("如密码未变可重新保存：cred-save；已改密请先更新后再 autologin。")
+        elif reason == "credentials_needs_update":
+            _print("已停止：上次自动登录失败（%s），已熔断以防连续失败锁号。"
+                   % ((cred or {}).get("last_fail_diag") or "原因见 cred-status"))
+            _print("请确认密码后运行 cred-save 更新凭据（更新将自动解除熔断）。")
+        return 2
+    _print("凭据检查通过（%s），开始登录…" % ev.get("reason"))
+    username = cred["username"]
+    password = cred["password"]
+    credential_version = cred["version"]
+    result = login_and_save_session(data_dir, username, password)
+    del password, username
+    _print()
+    if result["outcome"] == "ok":
+        persisted = mark_login_ok(data_dir, credential_version)
+        code = _print_login_result(result, acct_hint=result.get("account_scope_id"))
+        _print("自动登录完成：凭据层已记录最近成功时间。" if persisted else
+               "登录完成；凭据已更新、清除或暂不可写，旧版本结果未写入当前凭据。")
+        return code
+    if result["outcome"] == "auth_failed":
+        persisted = mark_login_failed(data_dir, result.get("diag", ""), credential_version)
+        _print_login_result(result)
+        if persisted:
+            _print("凭据已标记「待更新」并熔断：自动登录将拒绝再试（防止连续失败锁号）。")
+            _print("请确认密码后运行 cred-save 更新（自动解除熔断）。")
+        else:
+            _print("本次旧版本登录失败；凭据已更新、清除或暂不可写，当前凭据状态未被修改。")
+        return 1
+    # network / environment：不熔断
+    code = _print_login_result(result)
+    if result["outcome"] == "environment":
+        _print("说明：环境问题与凭据无关，熔断状态未变。")
+    else:
+        _print("说明：网络等非凭据因素，熔断状态未变；可稍后重试 autologin。")
+    return code
 
 
 def cmd_fitness_token() -> int:
@@ -215,14 +334,18 @@ def cmd_fitness_token() -> int:
     if not token or not student_no.isdigit():
         _print("token 或学号格式无效（学号须为数字）")
         return 1
-    sess = _S.load_session(data_dir, acct) or {}
-    old_token = sess.get("tzjk_token")
-    old_no = sess.get("tzjk_student_no")
-    if bool(old_token) != bool(old_no):
-        _print("提示：旧配置中 token/学号不成对（残缺状态），本次将整体替换。")
-    sess["tzjk_token"] = token
-    sess["tzjk_student_no"] = student_no
-    _S.save_session(data_dir, acct, sess)
+    with authentication_lock(data_dir):
+        sess = _S.load_session(data_dir, acct)
+        if _S.get_active_file(data_dir) != acct or not sess:
+            _print("输入期间账号已切换或退出，未保存令牌；请重新运行本命令。")
+            return 1
+        old_token = sess.get("tzjk_token")
+        old_no = sess.get("tzjk_student_no")
+        if bool(old_token) != bool(old_no):
+            _print("提示：旧配置中 token/学号不成对（残缺状态），本次将整体替换。")
+        sess["tzjk_token"] = token
+        sess["tzjk_student_no"] = student_no
+        _S.save_session(data_dir, acct, sess)
     # R70 残余：学号脱敏输出（不打印完整学号）
     _print("体测令牌已写入本机会话（学号 %s****%s）。" % (student_no[:4], student_no[-2:]))
     _print("令牌不打印、不进日志；失效后请重新执行本命令。")
@@ -259,10 +382,14 @@ def cmd_seat_cookie() -> int:
     if not cookie or "wechatSESS" not in cookie:
         _print("Cookie 无效：未包含 wechatSESS 会话项（抓包时请先在微信里打开选座页面）。")
         return 1
-    sess = _S.load_session(data_dir, acct) or {}
-    sess["seat_cookie"] = cookie
-    sess["seat_cookie_saved_at"] = _now_s()
-    _S.save_session(data_dir, acct, sess)
+    with authentication_lock(data_dir):
+        sess = _S.load_session(data_dir, acct)
+        if _S.get_active_file(data_dir) != acct or not sess:
+            _print("输入期间账号已切换或退出，未保存Cookie；请重新运行本命令。")
+            return 1
+        sess["seat_cookie"] = cookie
+        sess["seat_cookie_saved_at"] = _now_s()
+        _S.save_session(data_dir, acct, sess)
     _print("选座会话 Cookie 已写入本机会话（%s）。" % _now_s())
     _print("不打印、不进日志；查询报 session_expired 时请重新抓包并重跑本命令。")
     return 0
@@ -313,11 +440,31 @@ def cmd_seat_check() -> int:
     return 0 if res.get("outcome") == "ok" else 1
 
 
+def _parse_save_cred_flag(rest: list[str]) -> int | None:
+    """解析 init 的 --save-cred [天数]（缺省默认时效；非数字回退默认）。"""
+    if "--save-cred" not in rest:
+        return None
+    idx = rest.index("--save-cred")
+    tail = rest[idx + 1: idx + 2]
+    if tail and tail[0].isdigit() and int(tail[0]) > 0:
+        return int(tail[0])
+    return DEFAULT_TTL_DAYS
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     mode = args[0] if args else "init"
+    rest = args[1:]
     if mode == "init":
-        return cmd_init()
+        return cmd_init(save_cred_ttl=_parse_save_cred_flag(rest))
+    if mode == "autologin":
+        return cmd_autologin()
+    if mode == "cred-save":
+        return cmd_cred_save()
+    if mode == "cred-status":
+        return cmd_cred_status()
+    if mode == "cred-clear":
+        return cmd_cred_clear()
     if mode == "status":
         return cmd_status()
     if mode == "logout":
@@ -328,7 +475,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_seat_cookie()
     if mode == "seat-check":
         return cmd_seat_check()
-    _print("用法：python -m src.auth.login_cli [init|status|logout|fitness-token|seat-cookie|seat-check]")
+    _print("用法：python -m src.auth.login_cli "
+           "[init|autologin|cred-save|cred-status|cred-clear|status|logout|"
+           "fitness-token|seat-cookie|seat-check]")
     return 2
 
 

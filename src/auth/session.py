@@ -12,12 +12,37 @@
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
+import os
+import tempfile
+import uuid
 from pathlib import Path
+from .file_lock import authentication_lock
 
 SESSIONS_DIRNAME = "sessions"
 ACTIVE_FILE = "active_session.json"
+
+# F29-R1：请求级账号绑定——自动恢复期间，工具内部读取 active 时必须使用
+# 「首次查询开始前」固定的账号，避免查询中切号导致跨账号读取/重放。
+# 绑定优先于磁盘真实值；恢复自身的发布校验必须用 get_active_file（真实读取）。
+_BOUND_ACCOUNT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "zjgsu_bound_account", default=None)
+
+
+def bind_account(account: str | None):
+    """在当前上下文绑定账号域（返回 token，供 reset_account 恢复）。"""
+    return _BOUND_ACCOUNT.set(account)
+
+
+def reset_account(token) -> None:
+    _BOUND_ACCOUNT.reset(token)
+
+
+def bound_account() -> str | None:
+    """当前上下文绑定的账号域；未绑定返回 None。"""
+    return _BOUND_ACCOUNT.get()
 
 
 def account_scope_id(username: str, client_id: str) -> str:
@@ -32,48 +57,74 @@ def _sessions_dir(data_dir: Path) -> Path:
 
 
 def save_session(data_dir: Path, account: str, session: dict) -> Path:
-    path = _sessions_dir(data_dir) / ("%s.json" % account)
-    path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    with authentication_lock(data_dir):
+        path = _sessions_dir(data_dir) / ("%s.json" % account)
+        record = dict(session, session_version=uuid.uuid4().hex)
+        _write_json(path, record)
+        return path
+
+
+def _write_json(path: Path, record: dict) -> None:
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".auth-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def load_session(data_dir: Path, account: str) -> dict | None:
-    path = _sessions_dir(data_dir) / ("%s.json" % account)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict) or not data.get("zjgsu_token"):
-        return None
-    return data
+    with authentication_lock(data_dir):
+        path = _sessions_dir(data_dir) / ("%s.json" % account)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not data.get("zjgsu_token"):
+            return None
+        return data
 
 
 def delete_session(data_dir: Path, account: str) -> bool:
-    path = _sessions_dir(data_dir) / ("%s.json" % account)
-    if path.exists():
-        path.unlink()
-        return True
-    return False
+    with authentication_lock(data_dir):
+        path = _sessions_dir(data_dir) / ("%s.json" % account)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
 
 
 def set_active(data_dir: Path, account: str) -> None:
-    (Path(data_dir) / ACTIVE_FILE).write_text(
-        json.dumps({"account_scope_id": account}, ensure_ascii=False, indent=2), encoding="utf-8")
+    with authentication_lock(data_dir):
+        _write_json(Path(data_dir) / ACTIVE_FILE, {"account_scope_id": account})
+
+
+def get_active_file(data_dir: Path) -> str | None:
+    """磁盘上的真实生效账号域（不受上下文绑定影响；发布/校验必须用它）。"""
+    with authentication_lock(data_dir):
+        path = Path(data_dir) / ACTIVE_FILE
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8")).get("account_scope_id")
+        except Exception:
+            return None
 
 
 def get_active(data_dir: Path) -> str | None:
-    path = Path(data_dir) / ACTIVE_FILE
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8")).get("account_scope_id")
-    except Exception:
-        return None
+    """当前生效账号域：请求上下文有绑定则用绑定值（F29-R1），否则读磁盘。"""
+    bound = _BOUND_ACCOUNT.get()
+    if bound is not None:
+        return bound
+    return get_active_file(data_dir)
 
 
 def clear_active(data_dir: Path) -> None:
-    path = Path(data_dir) / ACTIVE_FILE
-    if path.exists():
-        path.unlink()
+    with authentication_lock(data_dir):
+        path = Path(data_dir) / ACTIVE_FILE
+        if path.exists():
+            path.unlink()
