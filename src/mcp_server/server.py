@@ -28,6 +28,7 @@
 - get_source_health         来源健康（本地；不含秘密）
 - get_library_seats         图书馆选座实时余座（我去图书馆白标；本机会话 Cookie）
 - get_dorm_electric         寝室电表实时数据（电精灵匿名链路；2026-10-18 新增）
+- get_mp_articles           本地订阅库文章查询
 
 返回约定：
 - 每个工具返回完整 CallToolResult：content（文本=同一包装的 JSON）+ structuredContent；
@@ -67,10 +68,12 @@ from ..domain.models import (ApprovalsObservation, DigitalResourcesObservation,
                              TimetableWebObservation, TrainingPlanObservation,
                              TrainingPlanDocObservation,
                              LibrarySeatsObservation, DormElectricObservation)
+from ..domain.models import MpArticlesObservation
 from ..paths import default_data_dir
 from ..service.auto_relogin import attempt_auto_relogin, credential_issue_hint
 from ..service.campus_service import CampusService
 from ..service.electric_service import ElectricService
+from ..service.mp_articles_service import MpArticlesService
 from ..service.jwweb_service import JWWebService
 from ..service.query_cache import QueryCache
 from ..service.seat_service import SeatService
@@ -83,6 +86,7 @@ service = CampusService(store, DATA_DIR)
 jwweb_service = JWWebService(store, DATA_DIR)
 seat_service = SeatService(DATA_DIR)
 electric_service = ElectricService(DATA_DIR)
+mp_articles_service = MpArticlesService()
 query_cache = QueryCache()
 
 READ_ONLY_LOCAL = ToolAnnotations(
@@ -850,6 +854,31 @@ def get_dorm_electric(
     month: str | None = None,
 ) -> Annotated[CallToolResult, DormElectricObservation]:
     return _to_call_result(electric_service.get_dorm_electric(mode, month=month))
+
+
+@mcp.tool(
+    description=(
+        "读取已配置的本机 we-mp-rss SQLite 公众号文章（只读，不触网）；"
+        "来源为本机已有订阅，可能包含非校园公众号，采集时间及完整性未知。"
+        "mp_name 按公众号名称、keyword 按标题或摘要过滤；days 为最近 N 天"
+        "（0=不限，最多365），limit 默认20、最大50，offset 为从0开始的偏移。"
+        "按来源时间倒序；该时间可能为采集时间，不保证为实际发布时间。"
+        "has_more/next_offset 可继续翻页，不同页之间数据库变化可能导致重复或遗漏。"
+        "仅返回标题、摘要及安全文章链接；数据库未配置或不可读时返回 unavailable。"
+    ),
+    annotations=READ_ONLY_LOCAL,
+)
+def get_mp_articles(
+    mp_name: str | None = None,
+    keyword: str | None = None,
+    days: int = 7,
+    limit: int = 20,
+    offset: int = 0,
+) -> Annotated[CallToolResult, MpArticlesObservation]:
+    return _to_call_result(
+        mp_articles_service.get_mp_articles(
+            mp_name=mp_name, keyword=keyword, days=days, limit=limit, offset=offset)
+    )
 
 
 @mcp.tool(

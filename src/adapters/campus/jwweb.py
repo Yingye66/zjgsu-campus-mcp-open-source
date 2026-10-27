@@ -110,7 +110,8 @@ JXZXJHKC_INDEX_PATH = "/jwglxt/jxzxjhgl/jxzxjhkcxx_cxJxzxjhkcxxIndex.html"
 
 _PAGE_SIZE = 100   # 分页每页条数（页面默认 10/15，取大值减少请求次数；来源实测可接受）
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
 # ---------------- 传输（自带 cookie 会话，与解析分离） ----------------

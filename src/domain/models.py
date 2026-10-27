@@ -1412,3 +1412,18 @@ class DormElectricObservation(TypedDict, total=False):
     reason: str
     hint: str
     as_of: str
+
+
+class MpArticlesObservation(TypedDict, total=False):
+    """本机公众号采集库观测：覆盖及采集时间未知，分页跨调用非固定快照。"""
+    status: Status
+    module_id: str
+    query_time: str
+    data: dict
+    coverage: dict
+    pagination: dict
+    freshness: dict
+    issues: list
+    gaps: list[str]
+    reason: str
+    hint: str

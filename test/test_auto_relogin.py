@@ -758,7 +758,7 @@ class StdioRealToolTest(unittest.IsolatedAsyncioTestCase):
             cwd=tmp, env=env)
         async with Client(params) as client:
             tools = await client.list_tools()
-            self.assertEqual(len(tools.tools), 47)
+            self.assertEqual(len(tools.tools), 48)
             resp = await client.call_tool(
                 "get_grades", {"xnm": "2026", "xqm": "3", "force_refresh": True},
                 read_timeout_seconds=20)

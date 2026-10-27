@@ -22,7 +22,7 @@ command 是虚拟环境 Python；PYTHONPATH 是仓库根；ZJGSU_CAMPUS_DATA_DIR
 
 ## 已有用户更新
 
-默认main现为47工具版本。先在仓库根目录用`git status`确认并妥善保存本地修改，再执行`git pull --ff-only`；用本项目虚拟环境执行`python -m pip install -r requirements.txt`同步已声明依赖，包含培养方案正文使用的python-docx。确认MCP配置指向这份检出目录，重载本项目后客户端应发现47工具。GitHub更新不会自动替换另一个运行目录，也不应仅因升级重新登录或删除私人data。
+本版本注册 48 个工具。先在仓库根目录用`git status`确认并妥善保存本地修改，再执行`git pull --ff-only`；用本项目虚拟环境执行`python -m pip install -r requirements.txt`同步已声明依赖，包含培养方案正文使用的python-docx。确认MCP配置指向这份检出目录，重载本项目后客户端应发现48工具。GitHub更新不会自动替换另一个运行目录，也不应仅因升级重新登录或删除私人data。公众号工具需要另行配置已有本地订阅库，见[工具索引](tool-reference.md#get_mp_articles)。
 
 图书馆余座默认不发送明文身份Cookie，问到时提供官方人工入口；不要为日常使用开启不安全排障开关。电表需要本人核实的定位配置，匿名接口可达不证明设备归属；已有非空定位冲突会拒绝迁移。培养方案附件需有效教务会话及精确方案/年级，并检查文件身份、版本和文本完整性。本人借阅取消、校园卡与畅约仅人工导航，均不因升级恢复自动查询。
 

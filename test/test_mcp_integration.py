@@ -140,6 +140,7 @@ class McpStdioIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     "get_library_info",
                     "get_library_search",
                     "get_library_seats",
+                    "get_mp_articles",
                     "get_my_approvals",
                     "get_my_messages",
                     "get_my_profile",
