@@ -28,7 +28,7 @@
 - get_source_health         来源健康（本地；不含秘密）
 - get_library_seats         图书馆选座实时余座（我去图书馆白标；本机会话 Cookie）
 - get_dorm_electric         寝室电表实时数据（电精灵匿名链路；2026-10-18 新增）
-- get_mp_articles           本地订阅库文章查询
+- get_mp_articles           学校公众号文章查询（本机 we-mp-rss 采集库只读；2026-10-27 新增）
 
 返回约定：
 - 每个工具返回完整 CallToolResult：content（文本=同一包装的 JSON）+ structuredContent；
@@ -67,13 +67,17 @@ from ..domain.models import (ApprovalsObservation, DigitalResourcesObservation,
                              TeachingPlanObservation, TimetableObservation,
                              TimetableWebObservation, TrainingPlanObservation,
                              TrainingPlanDocObservation,
-                             LibrarySeatsObservation, DormElectricObservation)
-from ..domain.models import MpArticlesObservation
+                             LibrarySeatsObservation, DormElectricObservation,
+                             MpArticlesObservation, MpArticleContentObservation,
+                             MpRecentContentObservation)
 from ..paths import default_data_dir
 from ..service.auto_relogin import attempt_auto_relogin, credential_issue_hint
 from ..service.campus_service import CampusService
 from ..service.electric_service import ElectricService
+from ..service.mp_article_content_service import MpArticleContentService
 from ..service.mp_articles_service import MpArticlesService
+from ..service.mp_recent_content_service import MpRecentContentService
+from ..service.mp_weread_content_service import MpWereadContentService
 from ..service.jwweb_service import JWWebService
 from ..service.query_cache import QueryCache
 from ..service.seat_service import SeatService
@@ -87,6 +91,9 @@ jwweb_service = JWWebService(store, DATA_DIR)
 seat_service = SeatService(DATA_DIR)
 electric_service = ElectricService(DATA_DIR)
 mp_articles_service = MpArticlesService()
+mp_article_content_service = MpArticleContentService()
+mp_recent_content_service = MpRecentContentService(
+    mp_articles_service, mp_article_content_service, weread_service=MpWereadContentService())
 query_cache = QueryCache()
 
 READ_ONLY_LOCAL = ToolAnnotations(
@@ -471,7 +478,7 @@ def get_academic_progress(
         "查询培养方案文件列表（只读；教务网页版，全校文件库按适用年级过滤）。"
         "year 为 4 位适用年级（必填，如 2025，按来源适用年级字段过滤）；"
         "keyword 可选（方案名称/专业名子串，不区分大小写）。"
-        "每条返回方案名称（如 2024示例专业）、版本、适用年级列表原文、学院、专业、"
+        "每条返回方案名称（如 2023软件工程）、版本、适用年级列表原文、学院、专业、"
         "总学分、附件标志（附件正文下载未接入）。"
     ),
     annotations=READ_ONLY_NETWORK,
@@ -491,7 +498,7 @@ def get_training_plans(
     description=(
         "下载培养方案附件正文（只读；教务网页版 N153045 附件端点，官方 docx 原件）。"
         "plan_name 为方案名（必填，与 get_training_plans 的 plan_name 一致，"
-        "如 2024示例专业）；grade 为 4 位适用年级（必填，与 get_training_plans "
+        "如 2023软件工程）；grade 为 4 位适用年级（必填，与 get_training_plans "
         "的 year 同口径）。文件落盘本机 training_plan_docs/（docx 原件 + 提取的 "
         "txt 全文），返回落盘路径、大小与正文预览——不做任何写业务操作。"
         "建议先用 get_training_plans(year=grade, keyword=…) 核对 plan_name 原文。"
@@ -860,11 +867,28 @@ def get_dorm_electric(
     description=(
         "读取已配置的本机 we-mp-rss SQLite 公众号文章（只读，不触网）；"
         "来源为本机已有订阅，可能包含非校园公众号，采集时间及完整性未知。"
-        "mp_name 按公众号名称、keyword 按标题或摘要过滤；days 为最近 N 天"
-        "（0=不限，最多365），limit 默认20、最大50，offset 为从0开始的偏移。"
+        "scope=all（默认，全部订阅）/school（学校来源：ID 已确认 + 名称候选）/school_confirmed"
+        "（仅登记表中按 ID 已确认的来源）。权威身份只按稳定 ID 判定：confirmed/excluded 必须带 id，"
+        "仅写名称的条目只作候选、不能确认也不能排除；同名不同 ID 不互相继承状态；"
+        "pending 条目需带 school_evidence 或名称含学校关键词才进入 school；"
+        "登记表配置了但不可读/结构无效时，学校范围直接拒绝（不静默丢弃排除规则）；"
+        "解析为空时返回 unavailable，不退回全部订阅。"
+        "mp_ids 可指定 1..50 个来源 ID（与 scope 取交集，未命中项列出）；"
+        "显式空数组视为参数错误，不会扩成全订阅。"
+        "mp_name 按公众号名称过滤；keyword 单关键词、keywords 为同义词组（OR，合计≤12），"
+        "均按标题或摘要字面匹配（扩展词不保证语义召回）。"
+        "days 为最近 N 天（0=不限，最多365），limit 默认20、最大50，offset 从0开始；"
+        "count_total=false 时跳过计数，total_matched 为未知（total_matched_known=false），"
+        "has_more 由多取一条判断。"
         "按来源时间倒序；该时间可能为采集时间，不保证为实际发布时间。"
-        "has_more/next_offset 可继续翻页，不同页之间数据库变化可能导致重复或遗漏。"
-        "仅返回标题、摘要及安全文章链接；数据库未配置或不可读时返回 unavailable。"
+        "返回 scope_info（scope_sources=范围内口径、selected_sources=mp_ids 交集后口径、"
+        "unmatched_mp_ids、registry 状态）、每条 source_status（confirmed/pending/unscoped）、"
+        "source_category 与 performance（本次库内分段耗时）；"
+        "返回标题、摘要、来源分类和安全过滤后的链接；url_status=format_accepted_unverified "
+        "仅说明格式可接受，不保证链接可访问。url 缺失/过滤/格式待核实时提供 search_hint "
+        "（标题和公众号名称）供人工查找；若客户端已有网页搜索工具，可使用该线索搜索，"
+        "核对原公众号和文章身份后再展示，转载应明确标注。搜索是否联网取决于客户端；"
+        "本工具本身不联网，也不保证找得到原文。库未配置或不可读时返回 unavailable。"
     ),
     annotations=READ_ONLY_LOCAL,
 )
@@ -874,11 +898,81 @@ def get_mp_articles(
     days: int = 7,
     limit: int = 20,
     offset: int = 0,
+    scope: str = "all",
+    mp_ids: list[str] | None = None,
+    keywords: list[str] | None = None,
+    count_total: bool = True,
 ) -> Annotated[CallToolResult, MpArticlesObservation]:
     return _to_call_result(
         mp_articles_service.get_mp_articles(
-            mp_name=mp_name, keyword=keyword, days=days, limit=limit, offset=offset)
+            mp_name=mp_name, keyword=keyword, days=days, limit=limit, offset=offset,
+            scope=scope, mp_ids=mp_ids, keywords=keywords, count_total=count_total)
     )
+
+
+@mcp.tool(
+    description=(
+        "按需读取单篇公众号正文（只读；实时抓取公开页面，不落盘、不缓存）。"
+        "入参 url 必须是 https://mp.weixin.qq.com 的 22 位短链或规范化的 __biz/mid/idx/sn 形式；"
+        "返回标题、公众号名、正文文本与字数，max_chars 默认 20000（500..50000），超长标记 truncated。"
+        "不带登录态：付费/仅粉丝可见/已删除/需要验证的文章会返回 unavailable 并说明原因，不编造正文。"
+        "正文为页面文本抽取，图片、表格、视频与排版会丢失。"
+    ),
+    annotations=READ_ONLY_NETWORK,
+)
+def get_mp_article_content(
+    url: str,
+    max_chars: int = 20000,
+) -> Annotated[CallToolResult, MpArticleContentObservation]:
+    return _to_call_result(mp_article_content_service.read(url, max_chars=max_chars))
+
+
+@mcp.tool(
+    description=(
+        "按近期和公众号来源选候选，并逐篇读取公开微信文章正文供回答；"
+        "不按问题关键词预筛标题或摘要，避免遗漏仅出现在正文的信息。"
+        "本机已有订阅不代表所有公众号，默认 school 是学校来源候选；"
+        "食堂等未归类公众号可按名称或 ID 选择 scope=all。"
+        "每页最多 10 篇，按顺序联网；正文不写本地库，但客户端可能保存调用结果。"
+        "优先使用本机唯一账号微信读书登录态读取，可用时回退公开页面；"
+        "登录态或配额不可用、标识无法安全还原、公开页面不可读时无法读取。"
+        "留意 coverage、pagination、identity_status、truncated：部分失败、"
+        "截断、来源未核验或还有下一页时不得声称已查全，也不能把未找到当成没有。"
+        "图片、表格、视频可能遗漏，菜名和价格缺失时如实说明，引用来源和时间。"
+    ),
+    annotations=READ_ONLY_NETWORK,
+)
+def get_mp_recent_content(
+    mp_name: str | None = None,
+    days: int = 7,
+    limit: int = 5,
+    offset: int = 0,
+    scope: str = "school",
+    mp_ids: list[str] | None = None,
+    max_total_chars: int = 12000,
+) -> Annotated[CallToolResult, MpRecentContentObservation]:
+    return _to_call_result(mp_recent_content_service.read_recent(
+        mp_name=mp_name, days=days, limit=limit, offset=offset,
+        scope=scope, mp_ids=mp_ids, max_total_chars=max_total_chars))
+
+
+def _forbid_unknown_mp_tool_arguments() -> None:
+    """MCP 2.2 默认忽略额外字段并转换参数类型，不能让筛选条件意外扩范围。
+
+    仅调整这三个工具的 SDK 参数模型和公开 schema；其他工具行为保持不变。
+    SDK 升级时应复验相关 stdio 回归，避免私有注册 API 发生变化。
+    """
+    for name in ("get_mp_articles", "get_mp_article_content", "get_mp_recent_content"):
+        tool = mcp._tool_manager.get_tool(name)
+        if tool is None:
+            raise RuntimeError("公众号 MCP 工具未注册: " + name)
+        model = tool.fn_metadata.arg_model
+        model.model_config = {**model.model_config, "extra": "forbid", "strict": True}
+        model.model_rebuild(force=True)
+        tool.parameters = model.model_json_schema(by_alias=True)
+
+
+_forbid_unknown_mp_tool_arguments()
 
 
 @mcp.tool(

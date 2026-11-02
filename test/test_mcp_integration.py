@@ -57,13 +57,14 @@ def _event_stored(event_id: str) -> dict:
 
 
 @unittest.skipIf(SKIP_STDIO, "CAMPUS_SKIP_STDIO_TEST=1：显式跳过 stdio 集成测试")
-class McpStdioIntegrationTest(unittest.IsolatedAsyncioTestCase):
-    async def _run_client(self, data_dir: Path, callback):
+class _StdioClientMixin:
+    async def _run_client(self, data_dir: Path, callback, extra_env: dict | None = None):
         from mcp.client.client import Client
         from mcp.client.stdio import StdioServerParameters
 
         env = dict(os.environ)
         env["ZJGSU_CAMPUS_DATA_DIR"] = str(data_dir)
+        env.update(extra_env or {})
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "src.mcp_server.server"],
@@ -79,6 +80,9 @@ class McpStdioIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 "可用 CAMPUS_TEST_TMP_BASE 指定可写目录，或设 CAMPUS_SKIP_STDIO_TEST=1 显式跳过）"
                 % e) from e
 
+
+@unittest.skipIf(SKIP_STDIO, "CAMPUS_SKIP_STDIO_TEST=1：显式跳过 stdio 集成测试")
+class McpStdioIntegrationTest(_StdioClientMixin, unittest.IsolatedAsyncioTestCase):
     async def test_seeded_flow(self):
         with temp_dir() as td:
             data = Path(td)
@@ -110,7 +114,7 @@ class McpStdioIntegrationTest(unittest.IsolatedAsyncioTestCase):
             async def scenario(client):
                 tools = await client.list_tools()
                 names = sorted(t.name for t in tools.tools)
-                                                                                                                                                                                                                                                                # R44+F24+F28+F04ext：47 工具（44 验收清单 + get_library_seats + get_dorm_electric + get_training_plan_doc）
+                                                                                                                                                                                                                                                                # R44+F24+F28+F04ext：49 工具（新增 get_mp_article_content）（44 验收清单 + get_library_seats + get_dorm_electric + get_training_plan_doc + get_mp_articles）
                 self.assertEqual(names, [
                     "get_academic_progress",
                     "get_academic_warnings",
@@ -140,7 +144,9 @@ class McpStdioIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     "get_library_info",
                     "get_library_search",
                     "get_library_seats",
+                    "get_mp_article_content",
                     "get_mp_articles",
+                    "get_mp_recent_content",
                     "get_my_approvals",
                     "get_my_messages",
                     "get_my_profile",
@@ -208,3 +214,197 @@ class McpStdioIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
             # R53：关键修复——真正 await _run_client（此前只定义 scenario 未执行）
             await self._run_client(data, scenario)
+
+
+@unittest.skipIf(SKIP_STDIO, "CAMPUS_SKIP_STDIO_TEST=1：显式跳过 stdio 集成测试")
+class MpArticlesStdioTest(_StdioClientMixin, unittest.IsolatedAsyncioTestCase):
+    """公众号来源圈定 + 加速参数的真实 stdio 合成调用（§2.172 第 3 步、§2.174 复验）。"""
+
+    @staticmethod
+    def _payload(result):
+        return json.loads(result.content[0].text)
+
+    async def test_recent_content_tool_schema_and_empty_source(self):
+        """真实 MCP 调用可发现近期正文工具，错参数拒绝且空来源不伪造结果。"""
+        from test.test_mp_articles_scope import build_db
+
+        with temp_dir() as td:
+            base = Path(td)
+            db = base / "synthetic.db"
+            build_db(db)
+
+            async def scenario(client):
+                tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                tool = tools["get_mp_recent_content"]
+                self.assertFalse(tool.input_schema.get("additionalProperties", True))
+                self.assertIn("coverage", tool.output_schema["properties"])
+                invalid = await client.call_tool("get_mp_recent_content", {"limti": 5})
+                self.assertTrue(invalid.is_error)
+                result = await client.call_tool("get_mp_recent_content", {
+                    "scope": "all", "mp_name": "不存在的合成公众号", "days": 365})
+                self.assertFalse(result.is_error)
+                payload = self._payload(result)
+                self.assertEqual(payload, result.structured_content)
+                self.assertEqual(payload["data"]["articles"], [])
+                self.assertFalse(payload["coverage"]["complete"])
+
+            await self._run_client(base, scenario,
+                                   extra_env={"ZJGSU_MP_RSS_DB": str(db),
+                                              "ZJGSU_MP_SOURCES": str(base / "missing.json")})
+
+    async def test_unknown_parameters_do_not_silently_widen_article_query(self):
+        """拼错筛选参数必须拒绝，不能把它当作未指定条件。"""
+        from test.test_mp_articles_scope import build_db
+
+        with temp_dir() as td:
+            base = Path(td)
+            db = base / "synthetic.db"
+            build_db(db)
+
+            async def scenario(client):
+                tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+                # 验证协议端真实行为，而不是只检查 Python 函数签名。
+                response = await client.call_tool(
+                    "get_mp_articles", {"days": 0, "keywrods": ["不存在的词"]})
+                self.assertTrue(response.is_error)
+                self.assertIsNone(response.structured_content)
+                self.assertIn("keywrods", response.content[0].text)
+                content_response = await client.call_tool(
+                    "get_mp_article_content", {"url": "not-a-url", "max_charz": 500})
+                self.assertTrue(content_response.is_error)
+                self.assertIn("max_charz", content_response.content[0].text)
+                for arguments in ({"days": False}, {"days": "0"}, {"limit": True},
+                                  {"count_total": "false"}):
+                    with self.subTest(arguments=arguments):
+                        invalid = await client.call_tool("get_mp_articles", arguments)
+                        self.assertTrue(invalid.is_error)
+                        self.assertIsNone(invalid.structured_content)
+                self.assertFalse(tools["get_mp_articles"].input_schema.get("additionalProperties", True))
+                self.assertFalse(tools["get_mp_article_content"].input_schema.get("additionalProperties", True))
+
+            await self._run_client(base, scenario,
+                                   extra_env={"ZJGSU_MP_RSS_DB": str(db),
+                                              "ZJGSU_MP_SOURCES": str(base / "missing.json")})
+
+    async def test_scope_and_fast_page_through_sdk(self):
+        from test.test_mp_articles_scope import build_db, write_registry
+
+        with temp_dir() as td:
+            base = Path(td)
+            db = base / "mp.db"
+            build_db(db)
+            registry = base / "mp_sources.json"
+            write_registry(registry, [
+                {"id": "feed-jwc", "name": "浙江工商大学教务处",
+                 "status": "confirmed", "category": "教务"},
+                {"id": "feed-hz", "name": "浙江工商大学杭州商学院", "status": "excluded"},
+            ])
+
+            async def scenario(client):
+                tools = await client.list_tools()
+                tool = [t for t in tools.tools if t.name == "get_mp_articles"][0]
+                self.assertEqual(set(tool.input_schema["properties"]),
+                                 {"mp_name", "keyword", "days", "limit", "offset",
+                                  "scope", "mp_ids", "keywords", "count_total"})
+                self.assertIn("scope_info", tool.output_schema["properties"])
+                self.assertIn("performance", tool.output_schema["properties"])
+
+                result = await client.call_tool(
+                    "get_mp_articles",
+                    {"scope": "school", "days": 0, "limit": 50, "count_total": False})
+                self.assertFalse(result.is_error)
+                payload = self._payload(result)
+                # 文本与结构化输出必须同源一致
+                self.assertEqual(payload, result.structured_content)
+                self.assertEqual(payload["status"], "ok")
+                self.assertIsNone(payload["coverage"]["total_matched"])
+                self.assertFalse(payload["coverage"]["total_matched_known"])
+                self.assertEqual(payload["scope_info"]["scope_sources"]["confirmed"], 1)
+                self.assertEqual(payload["scope_info"]["scope_sources"]["excluded"], 1)
+                names = {item["mp_name"] for item in payload["data"]["articles"]}
+                self.assertEqual(names, {"浙江工商大学", "浙江工商大学教务处",
+                                         "浙江工商大学计算机学院"})
+                self.assertTrue(all("source_category" in item
+                                    for item in payload["data"]["articles"]))
+                self.assertIn("performance", payload)
+
+                confirmed = await client.call_tool(
+                    "get_mp_articles",
+                    {"scope": "school_confirmed", "days": 0, "limit": 50})
+                self.assertFalse(confirmed.is_error)
+                cpayload = self._payload(confirmed)
+                self.assertEqual(cpayload, confirmed.structured_content)
+                self.assertEqual(cpayload["status"], "ok")
+                self.assertEqual({i["mp_id"] for i in cpayload["data"]["articles"]},
+                                 {"feed-jwc"})
+                self.assertTrue(all(i["source_status"] == "confirmed"
+                                    for i in cpayload["data"]["articles"]))
+
+                # 空 ID 列表必须是参数错误，不能扩成全订阅
+                empty_ids = await client.call_tool(
+                    "get_mp_articles", {"scope": "all", "days": 0, "mp_ids": []})
+                self.assertTrue(empty_ids.is_error)
+                epayload = self._payload(empty_ids)
+                self.assertEqual(epayload["status"], "unavailable")
+                self.assertIn("不能为空", epayload["reason"])
+                self.assertNotIn("data", epayload)
+
+            await self._run_client(base, scenario,
+                                   extra_env={"ZJGSU_MP_RSS_DB": str(db),
+                                              "ZJGSU_MP_SOURCES": str(registry)})
+
+    async def test_missing_registry_refuses_school_confirmed_over_sdk(self):
+        from test.test_mp_articles_scope import build_db
+
+        with temp_dir() as td:
+            base = Path(td)
+            db = base / "mp.db"
+            build_db(db)
+
+            async def scenario(client):
+                result = await client.call_tool(
+                    "get_mp_articles", {"scope": "school_confirmed", "days": 0})
+                self.assertTrue(result.is_error)
+                payload = self._payload(result)
+                self.assertEqual(payload, result.structured_content)
+                self.assertEqual(payload["status"], "unavailable")
+                self.assertIn("学校来源未解析", payload["reason"])
+                self.assertFalse(payload["scope_info"]["registry"]["configured"])
+
+            await self._run_client(base, scenario,
+                                   extra_env={"ZJGSU_MP_RSS_DB": str(db),
+                                              "ZJGSU_MP_SOURCES": str(base / "missing.json")})
+
+    async def test_registry_follows_each_data_dir_and_explicit_override(self):
+        """不同 profile 不能静默共享公众号的确认状态；显式路径仍可共享。"""
+        from test.test_mp_articles_scope import build_db, write_registry
+
+        with temp_dir() as td:
+            root = Path(td)
+            db = root / "synthetic.db"
+            build_db(db)
+            first, second = root / "first", root / "second"
+            first.mkdir()
+            second.mkdir()
+            write_registry(first / "mp_sources.json", [
+                {"id": "feed-jwc", "name": "示例来源一", "status": "confirmed"}])
+            write_registry(second / "mp_sources.json", [
+                {"id": "feed-cs", "name": "示例来源二", "status": "confirmed"}])
+
+            async def selected(client):
+                response = await client.call_tool(
+                    "get_mp_articles", {"scope": "school_confirmed", "days": 0})
+                self.assertFalse(response.is_error)
+                body = self._payload(response)
+                self.assertEqual(body, response.structured_content)
+                return {article["mp_id"] for article in body["data"]["articles"]}
+
+            default_env = {"ZJGSU_MP_RSS_DB": str(db), "ZJGSU_MP_SOURCES": ""}
+            first_result = await self._run_client(first, selected, extra_env=default_env)
+            second_result = await self._run_client(second, selected, extra_env=default_env)
+            explicit_result = await self._run_client(
+                second, selected, extra_env={"ZJGSU_MP_RSS_DB": str(db),
+                    "ZJGSU_MP_SOURCES": str(first / "mp_sources.json")})
+            self.assertEqual(first_result, {"feed-jwc"})
+            self.assertEqual(second_result, {"feed-cs"})
+            self.assertEqual(explicit_result, {"feed-jwc"})

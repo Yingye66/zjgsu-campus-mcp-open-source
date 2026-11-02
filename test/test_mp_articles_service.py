@@ -36,13 +36,13 @@ def build_db(path: Path):
     conn.executemany("INSERT INTO feeds VALUES (?,?)", feeds)
     arts = [
         ("a1", "synthetic-feed-a", "官微最新推送", NOW_TS - 3600,
-         "https://mp.weixin.qq.com/s/a1", "摘要一"),
+         "https://mp.weixin.qq.com/s/AAAAAAAAAAaaaaaaaaaa01", "摘要一"),
         ("a2", "synthetic-feed-b", "关于考试安排的通知", NOW_TS - 86400,
-         "https://mp.weixin.qq.com/s/a2", "含奖学金说明"),
+         "https://mp.weixin.qq.com/s/AAAAAAAAAAaaaaaaaaaa02", "含奖学金说明"),
         ("a3", "synthetic-feed-c", "学院讲座预告", NOW_TS - 86400 * 10,
-         "https://mp.weixin.qq.com/s/a3", ""),
+         "https://mp.weixin.qq.com/s/AAAAAAAAAAaaaaaaaaaa03", ""),
         ("a4", "synthetic-feed-a", "很旧的文章", NOW_TS - 86400 * 400,
-         "https://mp.weixin.qq.com/s/a4", ""),
+         "https://mp.weixin.qq.com/s/AAAAAAAAAAaaaaaaaaaa04", ""),
     ]
     for aid, mpid, title, ts, url, desc in arts:
         conn.execute(
@@ -86,6 +86,28 @@ class MpArticlesServiceTests(unittest.TestCase):
         self.assertEqual(r["status"], "ok")
         titles = [a["mp_name"] for a in r["data"]["articles"]]
         self.assertTrue(titles and all("教务处" in n for n in titles))
+
+    def test_storage_id_is_only_available_to_explicit_internal_callers(self):
+        """列表默认不暴露存储 ID；内部路径保留原始字节含义与对应文章。"""
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE articles SET id=? WHERE id='a1'", (" a1 ",))
+        conn.commit()
+        conn.close()
+        public = self.svc.get_mp_articles(days=0, limit=10)
+        self.assertTrue(all("_article_storage_id" not in row for row in public["data"]["articles"]))
+        internal = self.svc.get_mp_articles(days=0, limit=10, _include_internal_id=True)
+        by_title = {row["title"]: row["_article_storage_id"] for row in internal["data"]["articles"]}
+        self.assertEqual(by_title["官微最新推送"], " a1 ")
+        self.assertEqual(by_title["关于考试安排的通知"], "a2")
+
+    def test_non_text_storage_id_is_not_coerced_for_internal_use(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE articles SET id=? WHERE id='a1'", (sqlite3.Binary(b"raw-id"),))
+        conn.commit()
+        conn.close()
+        internal = self.svc.get_mp_articles(days=0, limit=10, _include_internal_id=True)
+        first = next(row for row in internal["data"]["articles"] if row["title"] == "官微最新推送")
+        self.assertIsNone(first["_article_storage_id"])
 
     def test_filter_by_keyword(self):
         r = self.svc.get_mp_articles(keyword="奖学金", days=0)
@@ -253,7 +275,7 @@ class MpArticlesServiceTests(unittest.TestCase):
                 cursor = reader.execute(sql, parameters)
                 if sql.startswith("SELECT COUNT(*)"):
                     writer.execute("INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?)", (
-                        "a5", "synthetic-feed-a", "并发新增", "", "https://mp.weixin.qq.com/s/a5", "",
+                        "a5", "synthetic-feed-a", "并发新增", "", "https://mp.weixin.qq.com/s/AAAAAAAAAAaaaaaaaaaa05", "",
                         NOW_TS - 1, "", "", 1))
                     writer.commit()
                 return cursor
@@ -295,6 +317,77 @@ class MpArticlesServiceTests(unittest.TestCase):
                 self.assertEqual(self.svc.get_mp_articles(**kwargs)["status"], "unavailable")
         missing = MpArticlesService(db_path=self.db.parent / "sensitive-local-name.db")
         self.assertNotIn(str(missing.db_path), json.dumps(missing.get_mp_articles(), ensure_ascii=False))
+
+    def test_synthetic_long_hash_link_is_omitted_and_counted(self):
+        fake = "https://mp.weixin.qq.com/s/WR1G9t1P83tJF0uC1u6vQ75B8NY11A6aw4mQEgb8FMBfk8g40hA6vNCHKBiPAlK3rW57P0Jn880"
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE articles SET url=? WHERE id='a1'", (fake,))
+        conn.commit()
+        conn.close()
+        result = self.svc.get_mp_articles(days=7, limit=50)
+        self.assertEqual(result["status"], "ok")
+        row = [a for a in result["data"]["articles"] if a["title"] == "官微最新推送"][0]
+        self.assertIsNone(row["url"])  # 死链不返回
+        issues = {i["code"]: i["safe_message"] for i in result["issues"]}
+        self.assertIn("unsafe_url_omitted", issues)
+        self.assertIn("22 位", issues["unsafe_url_omitted"])
+        self.assertNotIn("WR1G9t1P", json.dumps(result, ensure_ascii=False))
+
+    def test_short_link_requires_exact_22_char_hash(self):
+        lengths = {"a1": 21, "a2": 22, "a3": 23, "a4": 22}
+        conn = sqlite3.connect(self.db)
+        for aid, size in lengths.items():
+            conn.execute("UPDATE articles SET url=? WHERE id=?",
+                         ("https://mp.weixin.qq.com/s/" + "B" * size, aid))
+        conn.commit()
+        conn.close()
+        result = self.svc.get_mp_articles(days=0, limit=50)
+        by_title = {a["title"]: a["url"] for a in result["data"]["articles"]}
+        self.assertIsNone(by_title["官微最新推送"])       # 21 位
+        self.assertIsNotNone(by_title["关于考试安排的通知"])  # 22 位
+        self.assertIsNone(by_title["学院讲座预告"])       # 23 位
+        self.assertIsNotNone(by_title["很旧的文章"])      # 22 位
+
+    def test_missing_filtered_and_unverified_urls_have_safe_search_clues(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE articles SET url=NULL WHERE id='a1'")
+        conn.execute("UPDATE articles SET url=? WHERE id='a2'", ("javascript:synthetic-secret",))
+        conn.execute("UPDATE articles SET url=? WHERE id='a3'", (
+            "https://mp.weixin.qq.com/s/" + "W" * 75,))
+        conn.commit()
+        conn.close()
+        result = self.svc.get_mp_articles(days=0, limit=50)
+        by_title = {article["title"]: article for article in result["data"]["articles"]}
+        missing = by_title["官微最新推送"]
+        blocked = by_title["关于考试安排的通知"]
+        unknown = by_title["学院讲座预告"]
+        safe = by_title["很旧的文章"]
+        self.assertEqual(missing["url_status"], "missing")
+        self.assertEqual(blocked["url_status"], "safety_filtered")
+        self.assertEqual(unknown["url_status"], "format_unverified")
+        self.assertEqual(safe["url_status"], "format_accepted_unverified")
+        self.assertIsNotNone(safe["url"])
+        self.assertIsNone(safe["search_hint"])
+        for article in (missing, blocked, unknown):
+            self.assertIsNone(article["url"])
+            self.assertEqual(article["search_hint"]["title"], article["title"])
+            self.assertEqual(article["search_hint"]["mp_name"], article["mp_name"])
+            self.assertIn("待核对", article["search_hint"]["note"])
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("synthetic-secret", serialized)
+        self.assertNotIn("W" * 75, serialized)
+
+    def test_search_clue_fields_are_bounded(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE articles SET title=?, url=NULL WHERE id='a1'", ("题" * 1200,))
+        conn.execute("UPDATE feeds SET mp_name=? WHERE id='synthetic-feed-a'", ("名" * 500,))
+        conn.commit()
+        conn.close()
+        result = self.svc.get_mp_articles(days=7)
+        article = next(article for article in result["data"]["articles"] if article["url_status"] == "missing")
+        self.assertLessEqual(len(article["search_hint"]["title"]), 200)
+        self.assertLessEqual(len(article["search_hint"]["mp_name"]), 128)
+        self.assertNotIn("http", json.dumps(article["search_hint"], ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -1415,15 +1415,50 @@ class DormElectricObservation(TypedDict, total=False):
 
 
 class MpArticlesObservation(TypedDict, total=False):
-    """本机公众号采集库观测：覆盖及采集时间未知，分页跨调用非固定快照。"""
+    """本机公众号采集库观测：覆盖及采集时间未知，分页跨调用非固定快照。
+
+    scope_info 记录来源范围解析（学校候选/已确认/排除/未命中 ID）；
+    performance 只含本次库内分段耗时与语句数，不含路径、参数或正文。
+    """
     status: Status
     module_id: str
     query_time: str
+    semantic: str
     data: dict
+    scope_info: dict
     coverage: dict
     pagination: dict
     freshness: dict
     issues: list
     gaps: list[str]
+    performance: dict
     reason: str
     hint: str
+
+
+class MpArticleContentObservation(TypedDict, total=False):
+    """单篇公众号正文读取（实时公开页面，不落盘）：ok 时给 data.text，失败给 reason。"""
+    status: Status
+    module_id: str
+    query_time: str
+    url: str
+    data: dict
+    coverage: dict
+    freshness: dict
+    issues: list
+    gaps: list[str]
+    reason: str
+
+
+class MpRecentContentObservation(TypedDict, total=False):
+    """近期候选文章的有界正文读取；失败和未覆盖范围必须显式标注。"""
+    status: Status
+    module_id: str
+    data: dict
+    coverage: dict
+    pagination: dict
+    scope_info: dict
+    freshness: dict
+    issues: list
+    gaps: list[str]
+    reason: str
